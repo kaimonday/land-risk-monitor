@@ -66,26 +66,45 @@ def _prompt(text: str, part: tuple[int, int] | None = None) -> list[dict]:
     ]
 
 
+class ExtractionError(RuntimeError):
+    """A document couldn't be extracted after retries; the run moves on."""
+
+
 def call_groq(text: str, model: str = GROQ_MODEL, retries: int = 6, part: tuple[int, int] | None = None) -> dict:
     if not GROQ_API_KEY:
         raise SystemExit("GROQ_API_KEY is not set. Copy .env.example to .env and add your key.")
     body = {"model": model, "messages": _prompt(text, part), "temperature": 0,
             "response_format": {"type": "json_object"}}
     headers = {"Authorization": f"Bearer {GROQ_API_KEY}"}
+    last = "no attempts"
     for attempt in range(retries):
-        r = httpx.post(GROQ_URL, json=body, headers=headers, timeout=90)
-        if r.status_code == 429 and attempt < retries - 1:
-            wait = float(r.headers.get("retry-after", 2 ** (attempt + 1)))
+        backoff = min(2 ** (attempt + 1), 60)
+        try:
+            r = httpx.post(GROQ_URL, json=body, headers=headers, timeout=90)
+        except (httpx.TimeoutException, httpx.TransportError) as exc:
+            # Network trouble or a slow response: worth another try, not a crash.
+            last = f"{type(exc).__name__}: {exc}"
+            print(f"  {last}; retrying in {backoff}s")
+            time.sleep(backoff)
+            continue
+        if r.status_code == 429:
+            wait = float(r.headers.get("retry-after", backoff))
+            last = "rate limited"
             print(f"  rate limited, waiting {wait:.0f}s")
             time.sleep(wait)
+            continue
+        if r.status_code >= 500:
+            last = f"Groq server error {r.status_code}"
+            print(f"  {last}; retrying in {backoff}s")
+            time.sleep(backoff)
             continue
         if r.status_code == 413:
             raise SystemExit("Groq says the request is larger than your per-minute token limit. "
                              "Lower GROQ_MAX_INPUT_TOKENS in .env.")
-        r.raise_for_status()
+        r.raise_for_status()  # other client errors (bad key, bad request) won't fix themselves
         content = r.json()["choices"][0]["message"]["content"]
         return json.loads(content).get("fields", {})
-    raise RuntimeError("Groq request failed after retries")
+    raise ExtractionError(f"Groq request failed after {retries} attempts ({last})")
 
 
 def call_mock(document_id: str, text: str, seed: int = 11) -> dict:
@@ -340,17 +359,23 @@ def extract_all(provider: str = "groq", only: list[str] | None = None, pdf_dir: 
         raise SystemExit(f"No PDFs in {pdf_dir}. Run `python cli.py generate` first.")
 
     model = GROQ_MODEL if provider == "groq" else "mock"
-    done = 0
+    done, failed = 0, []
     for path in pdfs:
         doc_id = path.stem
         text, pages = pdf_text(path)
         if provider == "groq":
             parts = chunk_text(text, GROQ_MAX_INPUT_TOKENS * CHARS_PER_TOKEN)
-            if len(parts) == 1:
-                raw = call_groq(text)
-            else:
-                print(f"  {doc_id}: {len(parts)} parts")
-                raw = merge_chunks([call_groq(p, part=(i, len(parts))) for i, p in enumerate(parts, start=1)])
+            try:
+                if len(parts) == 1:
+                    raw = call_groq(text)
+                else:
+                    print(f"  {doc_id}: {len(parts)} parts")
+                    raw = merge_chunks([call_groq(p, part=(i, len(parts))) for i, p in enumerate(parts, start=1)])
+            except ExtractionError as exc:
+                # One lease's failure shouldn't cost the rest of a long run.
+                print(f"  {doc_id}: skipped ({exc})")
+                failed.append(doc_id)
+                continue
         else:
             raw = call_mock(doc_id, text)
         rows = validate(raw, text)
@@ -372,4 +397,7 @@ def extract_all(provider: str = "groq", only: list[str] | None = None, pdf_dir: 
         print(f"  {doc_id}: {len(rows)} fields, {low} below review threshold")
         done += 1
     print(f"Extracted {done} documents with provider={provider}")
+    if failed:
+        print(f"{len(failed)} failed: {' '.join(failed)}. Re-run them with --only {' '.join(failed)}")
+        raise SystemExit(1)
     return done
